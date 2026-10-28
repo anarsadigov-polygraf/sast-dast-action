@@ -105,10 +105,10 @@ jobs:
     strategy:
       matrix:
         url:
-          - name: back
-            value: https://target-url/
           - name: front
-            value: https://target-url
+            value: https://$TARGET_URL_FRONT/
+          - name: back
+            value: https://$TARGET_URL_BACK
     needs: [deploy]
     steps:
       - name: ZAP Scan
