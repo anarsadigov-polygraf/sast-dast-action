@@ -1,0 +1,121 @@
+name: deploy-dev
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sonarqube:
+    concurrency:
+      group: "ci-dev-${{ github.ref_name }}-sonarqube"
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Disabling shallow clones is recommended for improving the relevancy of reporting
+          fetch-depth: 0
+      - uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+  deploy:
+    concurrency:
+      group: "ci-dev-${{ github.ref_name }}-deploy"
+      cancel-in-progress: false
+    environment: dev
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: nschloe/action-cached-lfs-checkout@v1
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@v2
+        id: bun-setup
+      - name: Set up node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "lts/*"
+          package-manager-cache: false
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        id: node_modules_cache
+        with:
+          path: |
+            **/node_modules
+          key: ${{ runner.os }}-bun:${{ steps.bun-setup.outputs.bun-version }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun
+
+      - name: Cache bun cache
+        uses: actions/cache@v4
+        if: steps.node_modules_cache.outputs.cache-hit != 'true'
+        with:
+          path: |
+            ~/.bun/install/cache
+          key: bun-cache-${{ runner.os }}-bun:${{ steps.bun-setup.outputs.bun-version }}-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            bun-cache-${{ runner.os }}
+            bun-cache
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Cache sst internals
+        uses: actions/cache@v4
+        with:
+          path: |
+            .sst
+          key: ${{ runner.os }}-sst-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-sst
+
+      - name: Configure AWS credentials (dev)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_NUMBER }}:role/${{ vars.APP_NAME }}-${{ vars.APP_STAGE }}-github
+          aws-region: us-east-2
+
+      - name: Expose GitHub Runtime
+        uses: crazy-max/ghaction-github-runtime@v3
+
+      - name: Add SST's bin directory to PATH # fixes pulumi versioning issues
+        # Writing to $GITHUB_PATH causes GitHub Actions to prepend this directory to PATH,
+        # ensuring SST's version of Pulumi is found before GitHub Actions' version
+        run: echo "$HOME/.config/sst/bin" >> $GITHUB_PATH
+
+      - name: Deploy
+        run: |
+          set -euxo pipefail
+          bun sst install
+          bun sst deploy --stage ${{ vars.APP_STAGE }} --verbose | tee ${{ runner.temp }}/polygraf_dev.log
+          sed -n '/Complete/,$p' < ${{ runner.temp }}/polygraf_dev.log >> $GITHUB_STEP_SUMMARY
+
+  zap:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: "ci-dev-${{ github.ref_name }}-zap-${{ matrix.url.name }}"
+      cancel-in-progress: true
+    strategy:
+      matrix:
+        url:
+          - name: back
+            value: https://target-url/
+          - name: front
+            value: https://target-url
+    needs: [deploy]
+    steps:
+      - name: ZAP Scan
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          target: ${{ matrix.url.value }}
+          allow_issue_writing: false
+          artifact_name: zap_scan_${{matrix.url.name}}
+      - name: put zap scan result in summary
+        run: cat report_md.md >> $GITHUB_STEP_SUMMARY
